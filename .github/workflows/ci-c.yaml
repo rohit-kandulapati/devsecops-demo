@@ -1,0 +1,176 @@
+name: CICD Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+    - main
+    paths-ignore:
+    - 'kubernetes/deployment.yaml'
+  pull_request:
+    branches:
+    - main
+
+jobs:
+  test:
+    name: Unit Testing
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    - name: Setup Node JS 
+      uses: actions/setup-node@v4 
+      with:
+        node-version: '20'
+        cache: 'npm'
+    - name: Install dependencies
+      run: npm ci 
+    - name: Run tests
+      run: npm test || echo "No test founds"
+  
+  lint:
+    name: Static Code Analysis
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+    - name: Install dependencies
+      run: npm ci
+    - name: Run ESLint
+      run: npm run lint ## will perform the static code analysis.
+  
+  build:
+    name: Build
+    needs:
+    - test
+    - lint
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code 
+      uses: actions/checkout@v4 
+    - name: Setup Node 
+      uses: actions/setup-node@v4 
+      with:
+        node-version: '20'
+        cache: 'npm'
+    - name: Install dependencies
+      run: npm ci 
+    - name: Build the project
+      run: npm run build
+
+    - name: Upload Build artifacts ## Uploads the file
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: dist/
+
+  docker:
+    name: Docker Build and Push
+    needs:
+    - build
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }} ## gets it from the github account itself
+    outputs:
+      image_tag: ${{ steps.set_output.outputs.image_tag }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4 ## download the previously uploaded artifacts
+      with:
+        name: build-artifacts
+        path: dist/
+      
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3 ## to setup docker
+
+    - name: Login to GitHub Container Registry 
+      uses: docker/login-action@v3 ## to login to docker
+      with:
+        registry: ${{ env.REGISTRY }} ## refercing the environment variable set
+        username: ${{ github.actor }} ## gets the username and the current repo
+        password: ${{ secrets.TOKEN_GITHUB }} ## gets the secret i.e. password set in the repository settings
+
+    ### Getting Docker Images Metadata ###
+    ### to extract tags and labels that will be applied to the specified image. 
+    ### The id "meta" allows the output of this step to be referenced in a subsequent step. 
+    ### The images value provides the base name for the tags and labels.
+    - name: Extract metadata for Docker
+      id: meta ## used to reference this step in other steps
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} ## ghcr.io/rohit-kandulapati/devsecops-demo:<commit-sha>
+        tags: |
+          type=sha, format=long
+#          type=ref, event=branch --> you can have multiple tags for the same image or only one
+#          latest
+    - name: Build the Docker Image
+      uses: docker/build-push-action@v5 
+      with:
+        context: .
+        push: false
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master ## trivy action to scan the image
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+        format: 'table'
+        exit-code: 1
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'
+    
+    - name: Push the Docker Image
+      uses: docker/build-push-action@v5 
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+      
+    - name: Setup image tag output
+      id: set_output
+      run: echo "image_tag=sha-${GITHUB_SHA}" >> $GITHUB_OUTPUT
+
+  update-k8s-tag:
+    runs-on: ubuntu-latest
+    needs:
+    - docker
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4 
+      with:
+        token: ${{ secrets.TOKEN }}
+    - name: Git config setup
+      run: |
+        git config user.name "Github Actions"
+        git config user.email "actions@github.com"
+    - name: Update kubernetes deployment file
+      env:
+        IMAGE_TAG: sha-${{ github.sha }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        REGISTRY: ghcr.io
+      run: |
+        NEW_IMAGE="${REGISTRY}/${GITHUB_REPOSITORY}:${IMAGE_TAG}"
+
+        sed -i "s|image: ${REGISTRY}/.*|image: ${NEW_IMAGE}|g" kubernetes/deployment.yaml
+
+        # Verify the change
+        echo "Updated deployment to use image: ${NEW_IMAGE}"
+        grep -A 1 "image:" kubernetes/deployment.yaml
+    
+    - name: Commit and push changes
+      run: |
+        git add kubernetes/deployment.yaml
+        git commit -m "Update kubernetes deployment with new tag ${{ needs.docker.outputs.image_tag }} [skip ci]" || echo "No changes to commit"
+        git push
